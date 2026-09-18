@@ -136,7 +136,7 @@ public class NeoDevPlugin implements Plugin<Project> {
         });
 
         // 5. Unpack jar from 4.
-        var mcSourcesPath = project.file("src/main/java");
+        var mcSourcesPath = project.getRootProject().file("src/main/java");
         tasks.register("setup", Sync.class, task -> {
             task.setGroup(GROUP);
             task.from(project.zipTree(applyPatches.flatMap(ApplyPatches::getPatchedJar)));
@@ -208,7 +208,7 @@ public class NeoDevPlugin implements Plugin<Project> {
         var genSourcePatches = tasks.register("generateSourcePatches", GenerateSourcePatches.class, task -> {
             task.setGroup(INTERNAL_GROUP);
             task.getOriginalJar().set(applyInterfaceInjection.flatMap(TransformSources::getOutputJar));
-            task.getModifiedSources().set(project.file("src/main/java"));
+            task.getModifiedSources().set(project.getRootProject().file("src/main/java"));
             task.getPatchesJar().set(neoDevBuildDir.map(dir -> dir.file("source-patches.zip")));
         });
 
@@ -216,7 +216,7 @@ public class NeoDevPlugin implements Plugin<Project> {
         var genProductionPatches = tasks.register("generateProductionSourcePatches", GenerateSourcePatches.class, task -> {
             task.setGroup(INTERNAL_GROUP);
             task.getOriginalJar().set(applyAt.flatMap(TransformSources::getOutputJar));
-            task.getModifiedSources().set(project.file("src/main/java"));
+            task.getModifiedSources().set(project.getRootProject().file("src/main/java"));
             task.getPatchesFolder().set(neoDevBuildDir.map(dir -> dir.dir("production-source-patches")));
         });
 
