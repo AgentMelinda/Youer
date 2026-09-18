@@ -9,16 +9,17 @@ name: Java CI with Gradle
 
 on:
   push:
-    branches: [ "1.21.1" ]
+    branches: [ "linear-region-format" ]
   pull_request:
-    branches: [ "1.21.1" ]
+    branches: [ "linear-region-format" ]
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      packages: write
 
     steps:
     - uses: actions/checkout@v6
