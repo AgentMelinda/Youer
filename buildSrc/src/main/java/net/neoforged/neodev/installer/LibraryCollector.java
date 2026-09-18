@@ -56,7 +56,8 @@ class LibraryCollector {
     private static final List<String> HOST_WHITELIST = List.of(
             "minecraft.net",
             "neoforged.net",
-            "mojang.com"
+            "mojang.com",
+            "mohistmc.com"
     );
 
     private static final URI MOJANG_MAVEN = URI.create("https://libraries.minecraft.net");
@@ -170,6 +171,8 @@ class LibraryCollector {
     }
 
     private static URI joinUris(URI repositoryUrl, String path) {
+        // Encode special characters in the path (e.g., '+' in version strings)
+        path = path.replace("+", "%2B");
         var baseUrl = repositoryUrl.toString();
         if (baseUrl.endsWith("/") && path.startsWith("/")) {
             while (path.startsWith("/")) {
