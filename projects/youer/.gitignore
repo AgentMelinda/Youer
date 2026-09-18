@@ -1,4 +1,6 @@
-src
+src/*
+!src/test/
+!src/test/**
 build
 .gradle
 run

@@ -136,11 +136,16 @@ public class NeoDevPlugin implements Plugin<Project> {
         });
 
         // 5. Unpack jar from 4.
+        // Youer is a hybrid: patched Minecraft sources live next to Paper/Bukkit/Youer sources in the
+        // same src/main/java tree. Gradle Sync deletes destination files that were not in the copy
+        // spec, which would wipe those extra packages after applyPatches. Preserve keeps them while
+        // still overwriting files that are present in the patched jar (including Linear region sources).
         var mcSourcesPath = project.getRootProject().file("src/main/java");
         tasks.register("setup", Sync.class, task -> {
             task.setGroup(GROUP);
             task.from(project.zipTree(applyPatches.flatMap(ApplyPatches::getPatchedJar)));
             task.into(mcSourcesPath);
+            task.preserve(spec -> spec.include("**"));
         });
 
         /*
@@ -220,6 +225,21 @@ public class NeoDevPlugin implements Plugin<Project> {
             task.getPatchesFolder().set(neoDevBuildDir.map(dir -> dir.dir("production-source-patches")));
         });
 
+        // Youer hybrid: src/main/java also contains Paper/Bukkit/Youer sources. Diffing that whole tree
+        // produces "new file" production patches for those packages. If binpatcher consumes them, those
+        // classes are injected into the Minecraft module while the universal NeoForge jar still ships
+        // the same packages → java.lang.module.ResolutionException (split package).
+        // Only Minecraft packages belong in server binary patches; everything else stays in universal.
+        var minecraftProductionPatchesDir = neoDevBuildDir.map(dir -> dir.dir("minecraft-production-source-patches"));
+        var minecraftProductionPatches = tasks.register("filterMinecraftProductionSourcePatches", Sync.class, task -> {
+            task.setGroup(INTERNAL_GROUP);
+            task.dependsOn(genProductionPatches);
+            task.from(genProductionPatches.flatMap(GenerateSourcePatches::getPatchesFolder), spec -> {
+                spec.include("net/minecraft/**");
+            });
+            task.into(minecraftProductionPatchesDir);
+        });
+
         // Update the patch/ folder with the current patches.
         tasks.register("genPatches", Sync.class, task -> {
             task.setGroup(GROUP);
@@ -284,7 +304,8 @@ public class NeoDevPlugin implements Plugin<Project> {
                 configurations,
                 createCleanArtifacts,
                 neoDevBuildDir,
-                genProductionPatches.flatMap(GenerateSourcePatches::getPatchesFolder)
+                minecraftProductionPatchesDir,
+                minecraftProductionPatches
         );
 
         var installerRepositoryUrls = getInstallerRepositoryUrls(project);
@@ -541,7 +562,8 @@ public class NeoDevPlugin implements Plugin<Project> {
                                                                    NeoDevConfigurations configurations,
                                                                    TaskProvider<CreateCleanArtifacts> createCleanArtifacts,
                                                                    Provider<Directory> neoDevBuildDir,
-                                                                   Provider<Directory> sourcesPatchesFolder) {
+                                                                   Provider<Directory> sourcesPatchesFolder,
+                                                                   TaskProvider<?> sourcesPatchesTask) {
         var tasks = project.getTasks();
 
         var artConfig = configurations.getExecutableTool(Tools.AUTO_RENAMING_TOOL);
@@ -582,6 +604,7 @@ public class NeoDevPlugin implements Plugin<Project> {
         for (var generateBinPatchesTask : List.of(generateMergedBinPatches, generateClientBinPatches, generateServerBinPatches)) {
             generateBinPatchesTask.configure(task -> {
                 task.setGroup(INTERNAL_GROUP);
+                task.dependsOn(sourcesPatchesTask);
                 task.classpath(binpatcherConfig);
                 task.getPatchedJar().set(tasks.named("jar", Jar.class).flatMap(Jar::getArchiveFile));
                 task.getSourcePatchesFolder().set(sourcesPatchesFolder);

@@ -671,7 +671,7 @@
                  }
              }
          }
-@@ -633,8 +_,27 @@
+@@ -633,8 +_,30 @@
          try {
              this.storageSource.close();
          } catch (IOException ioexception) {
@@ -689,6 +689,9 @@
 +            this.getProfileCache().save(false); // Paper - Perf: Async GameProfileCache saving
 +        }
 +        // Spigot end
++        // Youer start - Linear region format background flusher
++        com.mohistmc.youer.region.LinearRegionFileFlusher.shutdown();
++        // Youer end
 +        // Paper start - move final shutdown items here
 +        Util.shutdownExecutors();
 +        try {

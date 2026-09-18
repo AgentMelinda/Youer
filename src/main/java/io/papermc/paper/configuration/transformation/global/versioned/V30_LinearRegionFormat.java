@@ -1,0 +1,16 @@
+package io.papermc.paper.configuration.transformation.global.versioned;
+
+import com.mohistmc.org.spongepowered.configurate.transformation.ConfigurationTransformation;
+
+public final class V30_LinearRegionFormat {
+
+    private static final int VERSION = 30;
+
+    private V30_LinearRegionFormat() {
+    }
+
+    public static void apply(final ConfigurationTransformation.VersionedBuilder builder) {
+        // New keys are filled from GlobalConfiguration defaults when the node is refreshed.
+        builder.addVersion(VERSION, ConfigurationTransformation.builder().build());
+    }
+}

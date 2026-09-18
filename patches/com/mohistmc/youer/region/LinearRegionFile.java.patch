@@ -1,29 +1,29 @@
 --- /dev/null
 +++ b/com/mohistmc/youer/region/LinearRegionFile.java
-@@ -1,0 +_,436 @@
+@@ -1,0 +_,816 @@
 +package com.mohistmc.youer.region;
 +
 +import com.github.luben.zstd.ZstdInputStream;
 +import com.github.luben.zstd.ZstdOutputStream;
 +import com.mojang.logging.LogUtils;
-+import java.io.BufferedInputStream;
 +import java.io.ByteArrayInputStream;
 +import java.io.ByteArrayOutputStream;
 +import java.io.DataInputStream;
 +import java.io.DataOutputStream;
-+import java.io.EOFException;
-+import java.io.FilterOutputStream;
++import java.io.FilterInputStream;
 +import java.io.IOException;
-+import java.io.OutputStream;
++import java.io.InputStream;
 +import java.nio.ByteBuffer;
-+import java.nio.channels.Channels;
++import java.nio.IntBuffer;
 +import java.nio.channels.FileChannel;
 +import java.nio.file.AtomicMoveNotSupportedException;
 +import java.nio.file.Files;
 +import java.nio.file.Path;
 +import java.nio.file.StandardCopyOption;
 +import java.nio.file.StandardOpenOption;
-+import java.util.Arrays;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.zip.CRC32;
 +import javax.annotation.Nullable;
 +import net.minecraft.FileUtil;
 +import net.minecraft.Util;
@@ -32,34 +32,39 @@
 +import net.minecraft.world.level.chunk.storage.RegionStorageInfo;
 +import org.slf4j.Logger;
 +
-+// Linear region format (github.com/xymb-endcrystalme/LinearRegionFileFormatTools), v1 spec.
-+// Unlike Anvil, an entire 32x32 region is compressed as a single zstd stream, so there is no in-place
-+// partial update: writes replace an in-memory slot. The background flusher briefly snapshots those
-+// immutable byte arrays, then serializes and compresses the WHOLE snapshot without holding this
-+// region's monitor, so reads and later writes do not wait for compression or disk I/O.
++/** Incremental Linear region storage with streaming v1 migration. */
 +public class LinearRegionFile extends RegionFile {
 +    private static final Logger LOGGER = LogUtils.getLogger();
 +
 +    public static final String LINEAR_EXTENSION = ".linear";
 +
 +    private static final long SIGNATURE = 0xc3ff13183cca9d9aL;
-+    private static final int SUPPORTED_VERSION = 1;
-+    private static final int ENTRY_COUNT = 1024; // 32 x 32 chunks per region
-+    // signature(8) + version(1) + newest_timestamp(8) + compression_level(1) + chunk_count(2) + body_length(4) + reserved(8)
-+    private static final int OUTER_HEADER_LENGTH = 32;
-+    private static final int INNER_HEADER_LENGTH = ENTRY_COUNT * 8; // (size:uint32, timestamp:uint32) per slot
-+    private static final byte[] RESERVED = new byte[8];
++    private static final int VERSION_1 = 1;
++    private static final int VERSION_2 = 2;
++    private static final int ENTRY_COUNT = 1024;
++    private static final int FILE_HEADER_LENGTH = 32;
++    private static final int V1_INNER_HEADER_LENGTH = ENTRY_COUNT * 8;
++    private static final int RECORD_MAGIC = 0x4c524543;
++    private static final int RECORD_COMMIT_MAGIC = 0x434f4d54;
++    private static final int RECORD_HEADER_LENGTH = 32;
++    private static final int RECORD_FOOTER_LENGTH = Integer.BYTES;
++    private static final int FLAG_TOMBSTONE = 1;
++    private static final int MAX_CHUNK_BYTES = 512 * 1024 * 1024;
 +
 +    private final RegionStorageInfo info;
 +    private final Path path;
 +    private final Path folder;
 +    private final boolean sync;
++    private final Entry[] entries = new Entry[ENTRY_COUNT];
++    private final PendingWrite[] pendingWrites = new PendingWrite[ENTRY_COUNT];
 +
-+    private final byte[][] chunks = new byte[ENTRY_COUNT][];
-+    private final int[] timestamps = new int[ENTRY_COUNT];
++    private FileChannel file;
 +    private long currentGeneration;
 +    private long persistedGeneration;
 +    private long completedFlushAttempts;
++    private long pendingBytes;
++    private long liveRecordBytes;
++    private long staleRecordBytes;
 +    private IOException lastFlushFailure;
 +    private boolean closing;
 +    private boolean closed;
@@ -70,9 +75,9 @@
 +        this.path = path;
 +        this.folder = folder;
 +        this.sync = sync;
-+        if (Files.isRegularFile(path)) {
-+            this.load();
-+        }
++        FileUtil.createDirectoriesSafe(folder);
++        this.prepareExistingFile();
++        this.openV2File();
 +    }
 +
 +    private static int getIndex(ChunkPos pos) {
@@ -83,106 +88,162 @@
 +        return (int) (Util.getEpochMillis() / 1000L);
 +    }
 +
-+    private void load() throws IOException {
-+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(this.path)))) {
-+            long signature = in.readLong();
-+            if (signature != SIGNATURE) {
-+                LOGGER.error("Linear region file {} has an invalid signature (0x{}); treating it as empty so its chunks will be regenerated", this.path, Long.toHexString(signature));
-+                return;
++    private void prepareExistingFile() throws IOException {
++        if (!Files.isRegularFile(this.path) || Files.size(this.path) == 0L) {
++            return;
++        }
++        ByteBuffer prefix = ByteBuffer.allocate(Long.BYTES + 1);
++        try (FileChannel channel = FileChannel.open(this.path, StandardOpenOption.READ)) {
++            if (!readFully(channel, prefix, 0L)) {
++                throw new IOException("Linear region header is truncated: " + this.path);
 +            }
-+
-+            int version = in.readUnsignedByte();
-+            if (version != SUPPORTED_VERSION) {
-+                LOGGER.error("Linear region file {} has unsupported version {} (only version {} is supported); treating it as empty so its chunks will be regenerated", this.path, version, SUPPORTED_VERSION);
-+                return;
-+            }
-+
-+            in.readLong(); // newest_timestamp - informational only, recomputed from per-chunk timestamps on write
-+            in.readUnsignedByte(); // compression_level - informational only, zstd frames are self-describing
-+            int declaredChunkCount = in.readUnsignedShort();
-+            int bodyLength = in.readInt();
-+            in.readFully(new byte[8]); // reserved/hash - not verified for v1 compatibility, per spec
-+
-+            if (bodyLength < 0) {
-+                LOGGER.error("Linear region file {} declares a negative body length {}; treating it as empty so its chunks will be regenerated", this.path, bodyLength);
-+                return;
-+            }
-+
-+            byte[] compressedBody = in.readNBytes(bodyLength);
-+            if (compressedBody.length != bodyLength) {
-+                LOGGER.error("Linear region file {} is truncated: expected {} compressed body bytes but only read {}; treating it as empty so its chunks will be regenerated", this.path, bodyLength, compressedBody.length);
-+                return;
-+            }
-+
-+            long footerSignature = in.readLong();
-+            if (footerSignature != SIGNATURE) {
-+                LOGGER.error("Linear region file {} has an invalid footer signature (0x{}); it is likely truncated or corrupt, treating it as empty so its chunks will be regenerated", this.path, Long.toHexString(footerSignature));
-+                return;
-+            }
-+
-+            byte[] decompressed;
-+            try (DataInputStream zin = new DataInputStream(new ZstdInputStream(new ByteArrayInputStream(compressedBody)))) {
-+                decompressed = zin.readAllBytes();
-+            }
-+
-+            if (decompressed.length < INNER_HEADER_LENGTH) {
-+                LOGGER.error("Linear region file {} decompressed body ({} bytes) is smaller than the inner header ({} bytes); treating it as empty so its chunks will be regenerated", this.path, decompressed.length, INNER_HEADER_LENGTH);
-+                return;
-+            }
-+
-+            int[] sizes = new int[ENTRY_COUNT];
-+            try (DataInputStream headerIn = new DataInputStream(new ByteArrayInputStream(decompressed, 0, INNER_HEADER_LENGTH))) {
-+                for (int i = 0; i < ENTRY_COUNT; i++) {
-+                    sizes[i] = headerIn.readInt();
-+                    this.timestamps[i] = headerIn.readInt();
-+                }
-+            }
-+
-+            int offset = INNER_HEADER_LENGTH;
-+            int loaded = 0;
-+            for (int i = 0; i < ENTRY_COUNT; i++) {
-+                int size = sizes[i];
-+                if (size == 0) {
-+                    continue;
-+                }
-+                if (size < 0 || offset + size > decompressed.length) {
-+                    LOGGER.error(
-+                        "Linear region file {} chunk slot {} declares an out-of-bounds size {} (offset {}, decompressed body length {}); the remaining chunk slot(s) in this file will be dropped and regenerated",
-+                        this.path, i, size, offset, decompressed.length
-+                    );
-+                    break;
-+                }
-+                this.chunks[i] = Arrays.copyOfRange(decompressed, offset, offset + size);
-+                offset += size;
-+                loaded++;
-+            }
-+
-+            if (loaded != declaredChunkCount) {
-+                LOGGER.debug("Linear region file {} header chunk_count {} does not match {} chunk(s) actually parsed", this.path, declaredChunkCount, loaded);
-+            }
-+        } catch (EOFException eofexception) {
-+            LOGGER.error("Linear region file {} is truncated (unexpected end of file while reading header); treating it as empty so its chunks will be regenerated: {}", this.path, eofexception.toString());
-+            Arrays.fill(this.chunks, null);
-+            Arrays.fill(this.timestamps, 0);
-+        } catch (RuntimeException runtimeexception) {
-+            // com.github.luben.zstd throws unchecked exceptions on a malformed/corrupt zstd frame
-+            LOGGER.error("Linear region file {} could not be decoded, treating it as empty so its chunks will be regenerated: {}", this.path, runtimeexception.toString(), runtimeexception);
-+            Arrays.fill(this.chunks, null);
-+            Arrays.fill(this.timestamps, 0);
++        }
++        prefix.flip();
++        long signature = prefix.getLong();
++        int version = Byte.toUnsignedInt(prefix.get());
++        if (signature != SIGNATURE) {
++            throw new IOException("Linear region has invalid signature: " + this.path);
++        }
++        if (version == VERSION_1) {
++            this.migrateV1ToV2();
++        } else if (version != VERSION_2) {
++            throw new IOException("Unsupported Linear region version " + version + ": " + this.path);
 +        }
 +    }
 +
-+    @Override
-+    public Path getPath() {
-+        return this.path;
++    private void openV2File() throws IOException {
++        this.file = FileChannel.open(this.path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
++        if (this.file.size() == 0L) {
++            writeFileHeader(this.file);
++            if (this.sync) {
++                this.file.force(true);
++            }
++        }
++        this.loadV2Index();
 +    }
 +
-+    @Nullable
++    private void loadV2Index() throws IOException {
++        ByteBuffer header = ByteBuffer.allocate(FILE_HEADER_LENGTH);
++        if (!readFully(this.file, header, 0L)) {
++            throw new IOException("Linear v2 header is truncated: " + this.path);
++        }
++        header.flip();
++        long signature = header.getLong();
++        int version = Byte.toUnsignedInt(header.get());
++        if (signature != SIGNATURE || version != VERSION_2) {
++            throw new IOException("Invalid Linear v2 header: " + this.path);
++        }
++
++        long fileSize = this.file.size();
++        long position = FILE_HEADER_LENGTH;
++        long maxGeneration = 0L;
++        while (position + RECORD_HEADER_LENGTH + RECORD_FOOTER_LENGTH <= fileSize) {
++            ByteBuffer recordHeader = ByteBuffer.allocate(RECORD_HEADER_LENGTH);
++            if (!readFully(this.file, recordHeader, position)) {
++                break;
++            }
++            recordHeader.flip();
++            if (recordHeader.getInt() != RECORD_MAGIC) {
++                break;
++            }
++            int slot = Short.toUnsignedInt(recordHeader.getShort());
++            int flags = Short.toUnsignedInt(recordHeader.getShort());
++            int timestamp = recordHeader.getInt();
++            long generation = recordHeader.getLong();
++            int rawLength = recordHeader.getInt();
++            int compressedLength = recordHeader.getInt();
++            int checksum = recordHeader.getInt();
++            if (slot >= ENTRY_COUNT || rawLength < 0 || compressedLength < 0 || rawLength > MAX_CHUNK_BYTES || compressedLength > MAX_CHUNK_BYTES) {
++                break;
++            }
++            long recordLength = RECORD_HEADER_LENGTH + (long) compressedLength + RECORD_FOOTER_LENGTH;
++            if (position + recordLength > fileSize) {
++                break;
++            }
++            ByteBuffer footer = ByteBuffer.allocate(RECORD_FOOTER_LENGTH);
++            if (!readFully(this.file, footer, position + RECORD_HEADER_LENGTH + compressedLength)) {
++                break;
++            }
++            footer.flip();
++            if (footer.getInt() != RECORD_COMMIT_MAGIC) {
++                break;
++            }
++            Entry existing = this.entries[slot];
++            if (existing == null || generation >= existing.generation()) {
++                this.entries[slot] = new Entry(position + RECORD_HEADER_LENGTH, rawLength, compressedLength, timestamp, generation, checksum, (flags & FLAG_TOMBSTONE) != 0, recordLength);
++            }
++            maxGeneration = Math.max(maxGeneration, generation);
++            position += recordLength;
++        }
++
++        if (position != fileSize) {
++            LOGGER.warn("Discarding {} incomplete trailing byte(s) from Linear region {}", fileSize - position, this.path);
++            this.file.truncate(position);
++        }
++        this.currentGeneration = maxGeneration;
++        this.persistedGeneration = maxGeneration;
++        this.recalculateRecordUsage(position);
++    }
++
++    private void recalculateRecordUsage(long fileSize) {
++        long live = 0L;
++        for (Entry entry : this.entries) {
++            if (entry != null) {
++                live += entry.recordLength();
++            }
++        }
++        this.liveRecordBytes = live;
++        this.staleRecordBytes = Math.max(0L, fileSize - FILE_HEADER_LENGTH - live);
++    }
++
 +    @Override
-+    public synchronized DataInputStream getChunkDataInputStream(ChunkPos pos) throws IOException {
-+        this.ensureOpen();
-+        byte[] data = this.chunks[getIndex(pos)];
-+        return data == null ? null : new DataInputStream(new ByteArrayInputStream(data));
++    public synchronized boolean doesChunkExist(ChunkPos pos) {
++        PendingWrite pending = this.pendingWrites[getIndex(pos)];
++        if (pending != null) {
++            return pending.data() != null;
++        }
++        Entry entry = this.entries[getIndex(pos)];
++        return entry != null && !entry.tombstone();
++    }
++
++    @Override
++    @Nullable
++    public DataInputStream getChunkDataInputStream(ChunkPos pos) throws IOException {
++        byte[] data;
++        synchronized (this) {
++            this.ensureOpen();
++            int index = getIndex(pos);
++            PendingWrite pending = this.pendingWrites[index];
++            if (pending != null) {
++                return pending.data() == null ? null : new DataInputStream(new ByteArrayInputStream(pending.data()));
++            }
++            Entry entry = this.entries[index];
++            if (entry == null || entry.tombstone()) {
++                return null;
++            }
++            data = this.readEntry(entry);
++        }
++        return new DataInputStream(new ByteArrayInputStream(data));
++    }
++
++    private byte[] readEntry(Entry entry) throws IOException {
++        ByteBuffer compressed = ByteBuffer.allocate(entry.compressedLength());
++        if (!readFully(this.file, compressed, entry.payloadOffset())) {
++            throw new IOException("Truncated Linear chunk record in " + this.path);
++        }
++        byte[] raw;
++        try (ZstdInputStream zin = new ZstdInputStream(new ByteArrayInputStream(compressed.array()));
++             ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(32, entry.rawLength()))) {
++            zin.transferTo(out);
++            raw = out.toByteArray();
++        }
++        if (raw.length != entry.rawLength()) {
++            throw new IOException("Linear chunk decompressed length mismatch in " + this.path + ": expected " + entry.rawLength() + ", got " + raw.length);
++        }
++        if (checksum(raw) != entry.checksum()) {
++            throw new IOException("Linear chunk checksum mismatch in " + this.path);
++        }
++        return raw;
 +    }
 +
 +    @Override
@@ -192,43 +253,32 @@
 +    }
 +
 +    @Override
-+    public synchronized boolean hasChunk(ChunkPos pos) {
-+        return this.chunks[getIndex(pos)] != null;
-+    }
-+
-+    @Override
-+    public synchronized boolean doesChunkExist(ChunkPos pos) {
-+        // Unlike Anvil's sector-offset bookkeeping, there is nothing further to sanity-check beyond "did this
-+        // slot load successfully" once the region file itself has been parsed - equivalent to hasChunk() here.
-+        return this.hasChunk(pos);
-+    }
-+
-+    // Sum of currently-held decompressed chunk bytes, used by RegionFileStorage's memory-budget eviction
-+    public synchronized long estimatedMemoryUsageBytes() {
-+        long total = 0L;
-+        for (byte[] chunk : this.chunks) {
-+            if (chunk != null) {
-+                total += chunk.length;
-+            }
-+        }
-+        return total;
-+    }
-+
-+    @Override
 +    public synchronized void clear(ChunkPos pos) throws IOException {
 +        this.ensureWritable();
-+        int index = getIndex(pos);
-+        if (this.chunks[index] != null) {
-+            this.chunks[index] = null;
-+            this.timestamps[index] = getTimestamp();
-+            this.currentGeneration++;
-+            LinearRegionFileFlusher.scheduleFlush(this);
++        this.queueWrite(getIndex(pos), null, getTimestamp());
++    }
++
++    private void queueWrite(int index, @Nullable byte[] data, int timestamp) {
++        PendingWrite previous = this.pendingWrites[index];
++        if (previous != null && previous.data() != null) {
++            this.pendingBytes -= previous.data().length;
 +        }
++        PendingWrite pending = new PendingWrite(index, data, timestamp, ++this.currentGeneration);
++        this.pendingWrites[index] = pending;
++        if (data != null) {
++            this.pendingBytes += data.length;
++        }
++        LinearRegionFileFlusher.scheduleFlush(this);
++    }
++
++    @Override
++    public synchronized boolean hasChunk(ChunkPos pos) {
++        return this.doesChunkExist(pos);
 +    }
 +
 +    @Override
 +    public void flush() throws IOException {
-+        final long targetGeneration;
++        long targetGeneration;
 +        synchronized (this) {
 +            this.ensureOpen();
 +            targetGeneration = this.currentGeneration;
@@ -238,7 +288,7 @@
 +
 +    @Override
 +    public void close() throws IOException {
-+        final long targetGeneration;
++        long targetGeneration;
 +        synchronized (this) {
 +            if (this.closed) {
 +                return;
@@ -247,28 +297,43 @@
 +            targetGeneration = this.currentGeneration;
 +        }
 +
++        IOException failure = null;
 +        try {
 +            LinearRegionFileFlusher.flushAndWait(this, targetGeneration);
-+            synchronized (this) {
-+                this.closed = true;
-+            }
-+            LinearRegionFileFlusher.forget(this);
 +        } catch (IOException ioexception) {
-+            synchronized (this) {
-+                this.closing = false;
++            failure = ioexception;
++        }
++
++        synchronized (this) {
++            try {
++                this.file.close();
++            } catch (IOException ioexception) {
++                if (failure == null) {
++                    failure = ioexception;
++                } else {
++                    failure.addSuppressed(ioexception);
++                }
 +            }
-+            throw ioexception;
++            this.closed = true;
++            this.notifyAll();
++        }
++        LinearRegionFileFlusher.forget(this);
++        if (failure != null) {
++            throw failure;
 +        }
 +    }
 +
-+    // Overridable seam so tests can supply a fixed level without a running server's GlobalConfiguration
-+    protected int getCompressionLevel() {
-+        return io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.linearCompressionLevel;
++    @Override
++    public Path getPath() {
++        return this.path;
 +    }
 +
-+    // Overridable seam so tests can supply a fixed thread count without a running server's GlobalConfiguration
-+    protected int getCompressionThreads() {
-+        return io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.linearCompressionThreads;
++    public synchronized long estimatedMemoryUsageBytes() {
++        return this.pendingBytes + (long) ENTRY_COUNT * 64L;
++    }
++
++    synchronized long queuedBytes() {
++        return this.pendingBytes;
 +    }
 +
 +    synchronized long currentGeneration() {
@@ -284,110 +349,399 @@
 +    }
 +
 +    synchronized IOException awaitFlushProgress(long targetGeneration, long observedAttempt) throws InterruptedException {
-+        while (this.persistedGeneration < targetGeneration && this.completedFlushAttempts == observedAttempt) {
++        while (!this.closed && this.persistedGeneration < targetGeneration && this.completedFlushAttempts == observedAttempt) {
 +            this.wait();
 +        }
-+        return this.completedFlushAttempts == observedAttempt ? null : this.lastFlushFailure;
++        return this.lastFlushFailure;
 +    }
 +
-+    synchronized FlushSnapshot createFlushSnapshot() {
++    synchronized FlushBatch createFlushBatch() {
 +        if (this.persistedGeneration >= this.currentGeneration) {
 +            return null;
 +        }
-+        return new FlushSnapshot(this.chunks.clone(), this.timestamps.clone(), this.currentGeneration);
++        List<PendingWrite> writes = new ArrayList<>();
++        long maxGeneration = this.persistedGeneration;
++        for (PendingWrite pending : this.pendingWrites) {
++            if (pending != null) {
++                writes.add(pending);
++                maxGeneration = Math.max(maxGeneration, pending.generation());
++            }
++        }
++        return writes.isEmpty() ? null : new FlushBatch(List.copyOf(writes), maxGeneration);
 +    }
 +
-+    synchronized boolean completeFlush(FlushSnapshot snapshot, IOException failure) {
-+        if (failure == null) {
-+            this.persistedGeneration = Math.max(this.persistedGeneration, snapshot.generation());
++    void writeBatch(FlushBatch batch) throws IOException {
++        List<EncodedWrite> encoded = new ArrayList<>(batch.writes().size());
++        for (PendingWrite pending : batch.writes()) {
++            byte[] compressed = pending.data() == null ? new byte[0] : compress(pending.data(), this.getCompressionLevel(), this.getCompressionThreads());
++            encoded.add(new EncodedWrite(pending, compressed, pending.data() == null ? 0 : checksum(pending.data())));
 +        }
-+        this.lastFlushFailure = failure;
++
++        List<WrittenEntry> written = new ArrayList<>(encoded.size());
++        synchronized (this) {
++            this.ensureOpen();
++            long batchStart = this.file.size();
++            long position = batchStart;
++            try {
++                for (EncodedWrite encodedWrite : encoded) {
++                    PendingWrite pending = encodedWrite.pending();
++                    int flags = pending.data() == null ? FLAG_TOMBSTONE : 0;
++                    Entry entry = appendRecord(
++                        this.file,
++                        position,
++                        pending.index(),
++                        flags,
++                        pending.timestamp(),
++                        pending.generation(),
++                        pending.data() == null ? 0 : pending.data().length,
++                        encodedWrite.compressed(),
++                        encodedWrite.checksum()
++                    );
++                    written.add(new WrittenEntry(pending, entry));
++                    position += entry.recordLength();
++                }
++                this.file.force(this.sync);
++                for (WrittenEntry item : written) {
++                    Entry previous = this.entries[item.pending().index()];
++                    if (previous != null) {
++                        this.liveRecordBytes -= previous.recordLength();
++                        this.staleRecordBytes += previous.recordLength();
++                    }
++                    this.entries[item.pending().index()] = item.entry();
++                    this.liveRecordBytes += item.entry().recordLength();
++                }
++            } catch (IOException | RuntimeException failure) {
++                try {
++                    this.file.truncate(batchStart);
++                } catch (IOException truncateFailure) {
++                    failure.addSuppressed(truncateFailure);
++                }
++                throw failure;
++            }
++        }
++    }
++
++    synchronized boolean completeFlush(FlushBatch batch, @Nullable IOException failure) {
 +        this.completedFlushAttempts++;
++        this.lastFlushFailure = failure;
++        if (failure == null) {
++            this.persistedGeneration = Math.max(this.persistedGeneration, batch.generation());
++            for (PendingWrite written : batch.writes()) {
++                if (this.pendingWrites[written.index()] == written) {
++                    this.pendingWrites[written.index()] = null;
++                    if (written.data() != null) {
++                        this.pendingBytes -= written.data().length;
++                    }
++                }
++            }
++        }
 +        this.notifyAll();
 +        return this.persistedGeneration < this.currentGeneration;
 +    }
 +
-+    void writeSnapshot(FlushSnapshot snapshot) throws IOException {
-+        int chunkCount = 0;
-+        for (byte[] chunk : snapshot.chunks()) {
-+            if (chunk != null) {
-+                chunkCount++;
++    void compactIfNeeded() throws IOException {
++        FileChannel source;
++        Entry[] snapshot;
++        long fileSize;
++        synchronized (this) {
++            if (this.closed || this.liveRecordBytes == 0L) {
++                return;
 +            }
++            fileSize = this.file.size();
++            long threshold = (long) this.getCompactionThresholdMb() * 1024L * 1024L;
++            if (fileSize < threshold || this.staleRecordBytes < this.liveRecordBytes) {
++                return;
++            }
++            source = this.file;
++            snapshot = this.entries.clone();
 +        }
 +
-+        int level = this.getCompressionLevel();
-+        int workers = this.getCompressionThreads(); // zstd's own internal multi-threaded compression
-+        int newestTimestamp = 0;
-+        for (int timestamp : snapshot.timestamps()) {
-+            newestTimestamp = Math.max(newestTimestamp, timestamp);
++        Path tmp = Files.createTempFile(this.folder, "linear-compact-", ".tmp");
++        Entry[] compacted = new Entry[ENTRY_COUNT];
++        try (FileChannel target = FileChannel.open(tmp, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
++            writeFileHeader(target);
++            long position = FILE_HEADER_LENGTH;
++            for (int slot = 0; slot < snapshot.length; slot++) {
++                Entry entry = snapshot[slot];
++                if (entry == null || entry.tombstone()) {
++                    continue;
++                }
++                ByteBuffer compressed = ByteBuffer.allocate(entry.compressedLength());
++                if (!readFully(source, compressed, entry.payloadOffset())) {
++                    throw new IOException("Failed to read Linear record during compaction: " + this.path);
++                }
++                Entry newEntry = appendRecord(target, position, slot, 0, entry.timestamp(), entry.generation(), entry.rawLength(), compressed.array(), entry.checksum());
++                compacted[slot] = newEntry;
++                position += newEntry.recordLength();
++            }
++            target.force(true);
++        } catch (Throwable throwable) {
++            Files.deleteIfExists(tmp);
++            throw throwable;
 +        }
 +
-+        FileUtil.createDirectoriesSafe(this.folder);
-+        Path tmp = Files.createTempFile(this.folder, "linear-", ".tmp");
-+        try {
-+            try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-+                channel.position(OUTER_HEADER_LENGTH);
-+                OutputStream channelOutput = Channels.newOutputStream(channel);
-+                try (ZstdOutputStream zout = new ZstdOutputStream(new NonClosingOutputStream(channelOutput), level)) {
-+                    if (workers > 0) {
-+                        zout.setWorkers(workers);
-+                    }
-+                    DataOutputStream bodyOut = new DataOutputStream(zout);
-+                    for (int i = 0; i < ENTRY_COUNT; i++) {
-+                        byte[] chunk = snapshot.chunks()[i];
-+                        bodyOut.writeInt(chunk == null ? 0 : chunk.length);
-+                        bodyOut.writeInt(snapshot.timestamps()[i]);
-+                    }
-+                    for (byte[] chunk : snapshot.chunks()) {
-+                        if (chunk != null) {
-+                            bodyOut.write(chunk);
-+                        }
-+                    }
-+                }
-+
-+                long compressedLength = channel.position() - OUTER_HEADER_LENGTH;
-+                if (compressedLength > Integer.MAX_VALUE) {
-+                    throw new IOException("Linear region compressed body exceeds the v1 format limit: " + compressedLength + " bytes");
-+                }
-+
-+                ByteBuffer footer = ByteBuffer.allocate(Long.BYTES).putLong(SIGNATURE);
-+                footer.flip();
-+                writeFully(channel, footer);
-+
-+                ByteBuffer header = ByteBuffer.allocate(OUTER_HEADER_LENGTH);
-+                header.putLong(SIGNATURE);
-+                header.put((byte) SUPPORTED_VERSION);
-+                header.putLong(newestTimestamp);
-+                header.put((byte) level);
-+                header.putShort((short) chunkCount);
-+                header.putInt((int) compressedLength);
-+                header.put(RESERVED);
-+                header.flip();
-+                channel.position(0L);
-+                writeFully(channel, header);
-+                if (this.sync) {
-+                    channel.force(true);
-+                }
++        synchronized (this) {
++            if (this.file != source || this.closed) {
++                Files.deleteIfExists(tmp);
++                return;
 +            }
-+
++            this.file.close();
 +            try {
-+                Files.move(tmp, this.path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-+            } catch (AtomicMoveNotSupportedException ignored) {
-+                Files.move(tmp, this.path, StandardCopyOption.REPLACE_EXISTING);
++                atomicReplace(tmp, this.path);
++                this.file = FileChannel.open(this.path, StandardOpenOption.READ, StandardOpenOption.WRITE);
++                System.arraycopy(compacted, 0, this.entries, 0, ENTRY_COUNT);
++                this.recalculateRecordUsage(this.file.size());
++            } catch (IOException ioexception) {
++                this.file = FileChannel.open(this.path, StandardOpenOption.READ, StandardOpenOption.WRITE);
++                throw ioexception;
 +            }
-+        } catch (IOException ioexception) {
-+            Files.deleteIfExists(tmp);
-+            throw ioexception;
-+        } catch (RuntimeException runtimeexception) {
-+            Files.deleteIfExists(tmp);
-+            throw new IOException("Failed to encode linear region file " + this.path, runtimeexception);
 +        }
 +    }
 +
-+    private static void writeFully(FileChannel channel, ByteBuffer buffer) throws IOException {
-+        while (buffer.hasRemaining()) {
-+            channel.write(buffer);
++    public int mergeFromAnvil(Path anvilPath, int regionX, int regionZ) throws IOException {
++        if (!Files.isRegularFile(anvilPath)) {
++            return 0;
 +        }
++        int[] anvilTimestamps = readAnvilTimestamps(anvilPath);
++        long anvilModified = Files.getLastModifiedTime(anvilPath).toMillis();
++        long linearModified = Files.getLastModifiedTime(this.path).toMillis();
++        int selected = 0;
++
++        try (RegionFile anvil = new RegionFile(this.info, anvilPath, this.folder, false)) {
++            for (int slot = 0; slot < ENTRY_COUNT; slot++) {
++                int chunkX = (regionX << 5) + (slot & 31);
++                int chunkZ = (regionZ << 5) + (slot >>> 5);
++                ChunkPos pos = new ChunkPos(chunkX, chunkZ);
++                if (!anvil.doesChunkExist(pos)) {
++                    continue;
++                }
++                int linearTimestamp;
++                boolean linearPresent;
++                synchronized (this) {
++                    Entry entry = this.entries[slot];
++                    linearPresent = entry != null && !entry.tombstone();
++                    linearTimestamp = entry == null ? 0 : entry.timestamp();
++                    if (linearPresent) {
++                        try {
++                            this.readEntry(entry);
++                        } catch (IOException ioexception) {
++                            LOGGER.error("Linear chunk slot {} in {} failed validation; preferring a valid Anvil copy if available", slot, this.path, ioexception);
++                            linearPresent = false;
++                        }
++                    }
++                }
++                int anvilTimestamp = anvilTimestamps[slot];
++                boolean chooseAnvil = !linearPresent || anvilTimestamp > linearTimestamp || (anvilTimestamp == linearTimestamp && anvilModified > linearModified);
++                if (!chooseAnvil) {
++                    continue;
++                }
++                try (DataInputStream input = anvil.getChunkDataInputStream(pos)) {
++                    if (input == null) {
++                        continue;
++                    }
++                    byte[] data = input.readAllBytes();
++                    synchronized (this) {
++                        this.queueWrite(slot, data, anvilTimestamp == 0 ? getTimestamp() : anvilTimestamp);
++                    }
++                    selected++;
++                }
++            }
++        }
++
++        if (selected > 0) {
++            this.flush();
++        }
++        Path backup = backupPath(anvilPath, "merged");
++        Files.move(anvilPath, backup, StandardCopyOption.REPLACE_EXISTING);
++        LOGGER.warn("Merged duplicate region {} into {}; selected {} Anvil chunk(s). Original Anvil file archived as {}", anvilPath.getFileName(), this.path.getFileName(), selected, backup.getFileName());
++        return selected;
++    }
++
++    private static int[] readAnvilTimestamps(Path anvilPath) throws IOException {
++        ByteBuffer buffer = ByteBuffer.allocate(4096);
++        try (FileChannel channel = FileChannel.open(anvilPath, StandardOpenOption.READ)) {
++            readFully(channel, buffer, 4096L);
++        }
++        buffer.flip();
++        IntBuffer timestamps = buffer.asIntBuffer();
++        int[] result = new int[ENTRY_COUNT];
++        for (int index = 0; index < Math.min(timestamps.remaining(), ENTRY_COUNT); index++) {
++            result[index] = timestamps.get(index);
++        }
++        return result;
++    }
++
++    private void migrateV1ToV2() throws IOException {
++        Path tmp = Files.createTempFile(this.folder, "linear-v2-", ".tmp");
++        try (DataInputStream input = new DataInputStream(Files.newInputStream(this.path));
++             FileChannel output = FileChannel.open(tmp, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
++            long signature = input.readLong();
++            int version = input.readUnsignedByte();
++            if (signature != SIGNATURE || version != VERSION_1) {
++                throw new IOException("Invalid Linear v1 header: " + this.path);
++            }
++            input.readLong();
++            input.readUnsignedByte();
++            input.readUnsignedShort();
++            int bodyLength = input.readInt();
++            input.skipNBytes(8L);
++            if (bodyLength < 0) {
++                throw new IOException("Invalid Linear v1 body length " + bodyLength + ": " + this.path);
++            }
++
++            writeFileHeader(output);
++            int[] sizes = new int[ENTRY_COUNT];
++            int[] timestamps = new int[ENTRY_COUNT];
++            long position = FILE_HEADER_LENGTH;
++            long generation = 0L;
++            try (DataInputStream body = new DataInputStream(new ZstdInputStream(new LimitedInputStream(input, bodyLength)))) {
++                for (int slot = 0; slot < ENTRY_COUNT; slot++) {
++                    sizes[slot] = body.readInt();
++                    timestamps[slot] = body.readInt();
++                    if (sizes[slot] < 0 || sizes[slot] > MAX_CHUNK_BYTES) {
++                        throw new IOException("Invalid Linear v1 chunk length " + sizes[slot] + " at slot " + slot);
++                    }
++                }
++                for (int slot = 0; slot < ENTRY_COUNT; slot++) {
++                    if (sizes[slot] == 0) {
++                        continue;
++                    }
++                    byte[] raw = body.readNBytes(sizes[slot]);
++                    if (raw.length != sizes[slot]) {
++                        throw new IOException("Truncated Linear v1 chunk at slot " + slot + ": " + this.path);
++                    }
++                    byte[] compressed = compress(raw, this.getCompressionLevel(), this.getCompressionThreads());
++                    Entry entry = appendRecord(output, position, slot, 0, timestamps[slot], ++generation, raw.length, compressed, checksum(raw));
++                    position += entry.recordLength();
++                }
++            }
++            output.force(true);
++        } catch (Throwable throwable) {
++            Files.deleteIfExists(tmp);
++            throw throwable;
++        }
++
++        Path backup = backupPath(this.path, "v1");
++        Files.move(this.path, backup, StandardCopyOption.REPLACE_EXISTING);
++        try {
++            atomicReplace(tmp, this.path);
++        } catch (IOException ioexception) {
++            Files.move(backup, this.path, StandardCopyOption.REPLACE_EXISTING);
++            throw ioexception;
++        }
++        LOGGER.info("Migrated Linear v1 region {} to incremental v2; original archived as {}", this.path.getFileName(), backup.getFileName());
++    }
++
++    private static Entry appendRecord(FileChannel channel, long position, int slot, int flags, int timestamp, long generation, int rawLength, byte[] compressed, int checksum) throws IOException {
++        ByteBuffer header = ByteBuffer.allocate(RECORD_HEADER_LENGTH);
++        header.putInt(RECORD_MAGIC);
++        header.putShort((short) slot);
++        header.putShort((short) flags);
++        header.putInt(timestamp);
++        header.putLong(generation);
++        header.putInt(rawLength);
++        header.putInt(compressed.length);
++        header.putInt(checksum);
++        header.flip();
++        writeFully(channel, header, position);
++        if (compressed.length > 0) {
++            writeFully(channel, ByteBuffer.wrap(compressed), position + RECORD_HEADER_LENGTH);
++        }
++        ByteBuffer footer = ByteBuffer.allocate(RECORD_FOOTER_LENGTH).putInt(RECORD_COMMIT_MAGIC);
++        footer.flip();
++        writeFully(channel, footer, position + RECORD_HEADER_LENGTH + compressed.length);
++        long recordLength = RECORD_HEADER_LENGTH + (long) compressed.length + RECORD_FOOTER_LENGTH;
++        return new Entry(position + RECORD_HEADER_LENGTH, rawLength, compressed.length, timestamp, generation, checksum, (flags & FLAG_TOMBSTONE) != 0, recordLength);
++    }
++
++    private static void writeFileHeader(FileChannel channel) throws IOException {
++        ByteBuffer header = ByteBuffer.allocate(FILE_HEADER_LENGTH);
++        header.putLong(SIGNATURE);
++        header.put((byte) VERSION_2);
++        header.put((byte) 0);
++        header.putShort((short) 0);
++        header.putLong(Util.getEpochMillis());
++        header.position(FILE_HEADER_LENGTH);
++        header.flip();
++        writeFully(channel, header, 0L);
++    }
++
++    private static byte[] compress(byte[] raw, int level, int workers) throws IOException {
++        ByteArrayOutputStream output = new ByteArrayOutputStream(Math.max(64, raw.length / 2));
++        try (ZstdOutputStream zout = new ZstdOutputStream(output, level)) {
++            if (workers > 0) {
++                zout.setWorkers(workers);
++            }
++            zout.write(raw);
++        }
++        return output.toByteArray();
++    }
++
++    private static int checksum(byte[] data) {
++        CRC32 crc = new CRC32();
++        crc.update(data);
++        return (int) crc.getValue();
++    }
++
++    private int getCompressionLevel() {
++        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
++        return config == null
++            ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.compressionLevel
++            : config.unsupportedSettings.effectiveLinearCompressionLevel();
++    }
++
++    private int getCompressionThreads() {
++        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
++        return config == null
++            ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.compressionThreads
++            : config.unsupportedSettings.effectiveLinearCompressionThreads();
++    }
++
++    private int getCompactionThresholdMb() {
++        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
++        return config == null
++            ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.compactionThresholdMb
++            : config.unsupportedSettings.effectiveLinearCompactionThresholdMb();
++    }
++
++    private static boolean readFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
++        int offset = 0;
++        while (buffer.hasRemaining()) {
++            int read = channel.read(buffer, position + offset);
++            if (read < 0) {
++                return false;
++            }
++            if (read == 0) {
++                Thread.onSpinWait();
++            } else {
++                offset += read;
++            }
++        }
++        return true;
++    }
++
++    private static void writeFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
++        int offset = 0;
++        while (buffer.hasRemaining()) {
++            int written = channel.write(buffer, position + offset);
++            if (written == 0) {
++                Thread.onSpinWait();
++            } else {
++                offset += written;
++            }
++        }
++    }
++
++    private static void atomicReplace(Path source, Path target) throws IOException {
++        try {
++            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++        } catch (AtomicMoveNotSupportedException ignored) {
++            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
++        }
++    }
++
++    private static Path backupPath(Path original, String reason) {
++        return original.resolveSibling(original.getFileName() + "." + reason + "." + Util.getEpochMillis() + ".bak");
 +    }
 +
 +    private void ensureOpen() throws IOException {
@@ -407,7 +761,7 @@
 +        private final ChunkPos pos;
 +
 +        ChunkBuffer(ChunkPos pos) {
-+            super(8096);
++            super(8192);
 +            this.pos = pos;
 +        }
 +
@@ -415,25 +769,51 @@
 +        public void close() throws IOException {
 +            synchronized (LinearRegionFile.this) {
 +                LinearRegionFile.this.ensureWritable();
-+                int index = getIndex(this.pos);
-+                LinearRegionFile.this.chunks[index] = this.toByteArray();
-+                LinearRegionFile.this.timestamps[index] = getTimestamp();
-+                LinearRegionFile.this.currentGeneration++;
-+                LinearRegionFileFlusher.scheduleFlush(LinearRegionFile.this);
++                LinearRegionFile.this.queueWrite(getIndex(this.pos), this.toByteArray(), getTimestamp());
 +            }
 +        }
 +    }
 +
-+    static record FlushSnapshot(byte[][] chunks, int[] timestamps, long generation) {}
++    static record FlushBatch(List<PendingWrite> writes, long generation) {}
 +
-+    private static final class NonClosingOutputStream extends FilterOutputStream {
-+        private NonClosingOutputStream(OutputStream output) {
-+            super(output);
++    static record PendingWrite(int index, @Nullable byte[] data, int timestamp, long generation) {}
++
++    private record Entry(long payloadOffset, int rawLength, int compressedLength, int timestamp, long generation, int checksum, boolean tombstone, long recordLength) {}
++
++    private record WrittenEntry(PendingWrite pending, Entry entry) {}
++
++    private record EncodedWrite(PendingWrite pending, byte[] compressed, int checksum) {}
++
++    private static final class LimitedInputStream extends FilterInputStream {
++        private long remaining;
++
++        private LimitedInputStream(InputStream input, long remaining) {
++            super(input);
++            this.remaining = remaining;
 +        }
 +
 +        @Override
-+        public void close() throws IOException {
-+            this.flush();
++        public int read() throws IOException {
++            if (this.remaining == 0L) {
++                return -1;
++            }
++            int value = super.read();
++            if (value >= 0) {
++                this.remaining--;
++            }
++            return value;
++        }
++
++        @Override
++        public int read(byte[] data, int offset, int length) throws IOException {
++            if (this.remaining == 0L) {
++                return -1;
++            }
++            int read = super.read(data, offset, (int) Math.min(length, this.remaining));
++            if (read > 0) {
++                this.remaining -= read;
++            }
++            return read;
 +        }
 +    }
 +}

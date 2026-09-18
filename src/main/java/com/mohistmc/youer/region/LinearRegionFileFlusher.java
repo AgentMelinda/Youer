@@ -14,11 +14,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 
-// Background flusher for the Linear region format. Writes/clears mark a LinearRegionFile dirty and
-// enqueue it here instead of blocking the calling IOWorker thread with compression or disk I/O.
-// PENDING coalesces repeated writes and IN_FLIGHT guarantees that only one immutable snapshot of a
-// particular region is written at once. The fixed worker pool still allows different regions to be
-// processed in parallel.
+// Background flusher for the Linear region format. Writes are coalesced per chunk and workers append
+// only the newest dirty records. IN_FLIGHT guarantees one writer/compactor per region while different
+// regions can still progress in parallel.
 public final class LinearRegionFileFlusher {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final Object LIFECYCLE_LOCK = new Object();
@@ -29,6 +27,7 @@ public final class LinearRegionFileFlusher {
     private static ScheduledExecutorService scheduler;
     private static ExecutorService workers;
     private static boolean shuttingDown;
+    private static volatile long lastBackpressureLogNanos;
 
     private LinearRegionFileFlusher() {}
 
@@ -48,6 +47,11 @@ public final class LinearRegionFileFlusher {
             } catch (IOException ioexception) {
                 LOGGER.error("Failed to flush linear region file {} during shutdown", regionFile.getPath(), ioexception);
             }
+            return;
+        }
+        if (pendingQueuedBytes() > queueBudgetBytes()) {
+            submit(regionFile);
+            maybeLogBackpressure();
         }
     }
 
@@ -106,8 +110,12 @@ public final class LinearRegionFileFlusher {
         if (scheduler != null) {
             return;
         }
-        int threads = Math.max(1, io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.linearFlushThreads);
-        int intervalSeconds = Math.max(1, io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.linearFlushIntervalSeconds);
+        int threads = Math.max(1, linearFlushThreads());
+        int intervalSeconds = Math.max(1, linearFlushIntervalSeconds());
+        io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settings = settingsOrNull();
+        if (settings != null && (settings.effectiveLinearFlushQueueMaxMb() > 512 || settings.effectiveLinearRegionCacheMemoryBudgetMb() > 1024)) {
+            LOGGER.warn("Linear persistence is configured with a {} MiB queue and {} MiB cache. Incremental v2 normally needs at most 128 MiB queue and 256 MiB cache on a Ryzen 5 5500U-class server.", settings.effectiveLinearFlushQueueMaxMb(), settings.effectiveLinearRegionCacheMemoryBudgetMb());
+        }
 
         AtomicInteger workerId = new AtomicInteger();
         workers = Executors.newFixedThreadPool(threads, runnable -> {
@@ -137,6 +145,7 @@ public final class LinearRegionFileFlusher {
             LinearRegionFile regionFile = iterator.next();
             submit(regionFile);
         }
+        maybeLogBackpressure();
     }
 
     private static boolean submit(LinearRegionFile regionFile) {
@@ -165,15 +174,15 @@ public final class LinearRegionFileFlusher {
     }
 
     private static void flushOne(LinearRegionFile regionFile) {
-        LinearRegionFile.FlushSnapshot snapshot = regionFile.createFlushSnapshot();
-        if (snapshot == null) {
+        LinearRegionFile.FlushBatch batch = regionFile.createFlushBatch();
+        if (batch == null) {
             IN_FLIGHT.remove(regionFile);
             return;
         }
 
         IOException failure = null;
         try {
-            regionFile.writeSnapshot(snapshot);
+            regionFile.writeBatch(batch);
         } catch (IOException ioexception) {
             failure = ioexception;
             LOGGER.error("Failed to background-flush linear region file {}", regionFile.getPath(), ioexception);
@@ -181,10 +190,16 @@ public final class LinearRegionFileFlusher {
             failure = new IOException("Failed to flush linear region file " + regionFile.getPath(), runtimeexception);
             LOGGER.error("Failed to background-flush linear region file {}", regionFile.getPath(), runtimeexception);
         } finally {
-            // Release the per-region execution slot before waking explicit flush waiters. A waiter
-            // can then immediately submit the next generation instead of waiting for the timer.
+            boolean morePending = regionFile.completeFlush(batch, failure);
+            if (failure == null) {
+                try {
+                    regionFile.compactIfNeeded();
+                } catch (IOException ioexception) {
+                    LOGGER.error("Failed to compact linear region file {}", regionFile.getPath(), ioexception);
+                }
+            }
             IN_FLIGHT.remove(regionFile);
-            if (regionFile.completeFlush(snapshot, failure)) {
+            if (morePending) {
                 PENDING.add(regionFile);
             }
         }
@@ -207,21 +222,29 @@ public final class LinearRegionFileFlusher {
                 continue;
             }
 
-            LinearRegionFile.FlushSnapshot snapshot = regionFile.createFlushSnapshot();
-            if (snapshot == null) {
+            LinearRegionFile.FlushBatch batch = regionFile.createFlushBatch();
+            if (batch == null) {
                 IN_FLIGHT.remove(regionFile);
                 return;
             }
             IOException failure = null;
             try {
-                regionFile.writeSnapshot(snapshot);
+                regionFile.writeBatch(batch);
             } catch (IOException ioexception) {
                 failure = ioexception;
             } catch (RuntimeException runtimeexception) {
                 failure = new IOException("Failed to flush linear region file " + regionFile.getPath(), runtimeexception);
             } finally {
+                boolean morePending = regionFile.completeFlush(batch, failure);
+                if (failure == null) {
+                    try {
+                        regionFile.compactIfNeeded();
+                    } catch (IOException ioexception) {
+                        LOGGER.error("Failed to compact linear region file {}", regionFile.getPath(), ioexception);
+                    }
+                }
                 IN_FLIGHT.remove(regionFile);
-                if (regionFile.completeFlush(snapshot, failure)) {
+                if (morePending) {
                     PENDING.add(regionFile);
                 }
             }
@@ -229,6 +252,52 @@ public final class LinearRegionFileFlusher {
                 throw failure;
             }
         }
+    }
+
+    private static io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settingsOrNull() {
+        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
+        return config == null ? null : config.unsupportedSettings;
+    }
+
+    private static int linearFlushThreads() {
+        io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settings = settingsOrNull();
+        return settings == null ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.flushThreads : settings.effectiveLinearFlushThreads();
+    }
+
+    private static int linearFlushIntervalSeconds() {
+        io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settings = settingsOrNull();
+        return settings == null ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.flushIntervalSeconds : settings.effectiveLinearFlushIntervalSeconds();
+    }
+
+    private static long queueBudgetBytes() {
+        io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settings = settingsOrNull();
+        int megabytes = settings == null ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.flushQueueMaxMb : settings.effectiveLinearFlushQueueMaxMb();
+        return (long) Math.max(1, megabytes) * 1024L * 1024L;
+    }
+
+    private static long pendingQueuedBytes() {
+        long total = 0L;
+        for (LinearRegionFile regionFile : PENDING) {
+            total += regionFile.queuedBytes();
+        }
+        for (LinearRegionFile regionFile : IN_FLIGHT) {
+            total += regionFile.queuedBytes();
+        }
+        return total;
+    }
+
+    private static void maybeLogBackpressure() {
+        long queued = pendingQueuedBytes();
+        long budget = queueBudgetBytes();
+        if (queued <= budget) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now - lastBackpressureLogNanos < TimeUnit.SECONDS.toNanos(30)) {
+            return;
+        }
+        lastBackpressureLogNanos = now;
+        LOGGER.warn("Linear region persistence is falling behind: {} pending regions, ~{} MiB queued (budget {} MiB). Newest writes still coalesce; compression or disk may be saturated.", PENDING.size(), queued / (1024L * 1024L), budget / (1024L * 1024L));
     }
 
     // Drains any remaining dirty regions and waits for in-flight flushes before shutdown, so the JVM

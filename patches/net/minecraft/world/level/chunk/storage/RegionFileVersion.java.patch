@@ -23,13 +23,17 @@
      public static final RegionFileVersion VERSION_CUSTOM = register(new RegionFileVersion(127, null, p_323443_ -> {
          throw new UnsupportedOperationException();
      }, p_323444_ -> {
-@@ -61,6 +_,17 @@
+@@ -61,6 +_,21 @@
      private final RegionFileVersion.StreamWrapper<InputStream> inputWrapper;
      private final RegionFileVersion.StreamWrapper<OutputStream> outputWrapper;
  
 +    // Paper start - Configurable region compression format
 +    public static RegionFileVersion getCompressionFormat() {
-+        return switch (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.compressionFormat) {
++        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
++        if (config == null) {
++            return getSelected();
++        }
++        return switch (config.unsupportedSettings.compressionFormat) {
 +            case GZIP -> VERSION_GZIP;
 +            case ZLIB -> VERSION_DEFLATE;
 +            case LZ4 -> VERSION_LZ4;

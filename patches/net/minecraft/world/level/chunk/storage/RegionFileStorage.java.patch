@@ -12,7 +12,7 @@
  import java.nio.file.Path;
  import javax.annotation.Nullable;
  import net.minecraft.FileUtil;
-@@ -28,23 +_,61 @@
+@@ -28,23 +_,86 @@
          this.info = p_326161_;
      }
  
@@ -42,8 +42,8 @@
          } else {
 -            if (this.regionCache.size() >= 256) {
 +            // Youer start - also evict while over the Linear-specific memory budget (no-op for pure-Anvil caches)
-+            long memoryBudgetBytes = (long) io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.linearRegionCacheMemoryBudgetMb * 1024L * 1024L;
-+            while ((this.regionCache.size() >= io.papermc.paper.configuration.GlobalConfiguration.get().misc.regionFileCacheSize // Paper - Sanitise RegionFileCache and make configurable
++            long memoryBudgetBytes = linearCacheMemoryBudgetBytes();
++            while ((this.regionCache.size() >= regionFileCacheSize() // Paper - Sanitise RegionFileCache and make configurable
 +                    || this.currentEstimatedMemoryUsageBytes() > memoryBudgetBytes)
 +                    && !this.regionCache.isEmpty()) {
                  this.regionCache.removeLast().close();
@@ -60,11 +60,15 @@
 +
 +            RegionFile regionfile1;
 +            if (Files.exists(linearPath)) {
-+                regionfile1 = new LinearRegionFile(this.info, linearPath, this.folder, this.sync);
++                LinearRegionFile linearRegionFile = new LinearRegionFile(this.info, linearPath, this.folder, this.sync);
++                if (Files.exists(anvilPath)) {
++                    linearRegionFile.mergeFromAnvil(anvilPath, regionX, regionZ);
++                }
++                regionfile1 = linearRegionFile;
 +            } else if (Files.exists(anvilPath)) {
 +                regionfile1 = new RegionFile(this.info, anvilPath, this.folder, this.sync);
 +            } else {
-+                regionfile1 = switch (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.regionFileFormat) {
++                regionfile1 = switch (regionFileFormat()) {
 +                    case LINEAR -> new LinearRegionFile(this.info, linearPath, this.folder, this.sync);
 +                    case ANVIL -> new RegionFile(this.info, anvilPath, this.folder, this.sync);
 +                };
@@ -73,6 +77,27 @@
              return regionfile1;
          }
      }
++
++    private static io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings unsupportedSettingsOrNull() {
++        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
++        return config == null ? null : config.unsupportedSettings;
++    }
++
++    private static long linearCacheMemoryBudgetBytes() {
++        io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settings = unsupportedSettingsOrNull();
++        int megabytes = settings == null ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.LinearPreset.NORMAL.cacheMemoryBudgetMb : settings.effectiveLinearRegionCacheMemoryBudgetMb();
++        return (long) megabytes * 1024L * 1024L;
++    }
++
++    private static int regionFileCacheSize() {
++        io.papermc.paper.configuration.GlobalConfiguration config = io.papermc.paper.configuration.GlobalConfiguration.get();
++        return config == null ? MAX_CACHE_SIZE : config.misc.regionFileCacheSize;
++    }
++
++    private static io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.RegionFileFormat regionFileFormat() {
++        io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings settings = unsupportedSettingsOrNull();
++        return settings == null ? io.papermc.paper.configuration.GlobalConfiguration.UnsupportedSettings.RegionFileFormat.ANVIL : settings.regionFileFormat;
++    }
 +    // Youer end - Linear region format
  
      @Nullable

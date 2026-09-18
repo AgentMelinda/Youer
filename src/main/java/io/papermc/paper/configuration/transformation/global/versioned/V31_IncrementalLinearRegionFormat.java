@@ -1,0 +1,14 @@
+package io.papermc.paper.configuration.transformation.global.versioned;
+
+import com.mohistmc.org.spongepowered.configurate.transformation.ConfigurationTransformation;
+
+public final class V31_IncrementalLinearRegionFormat {
+    private static final int VERSION = 31;
+
+    private V31_IncrementalLinearRegionFormat() {
+    }
+
+    public static void apply(final ConfigurationTransformation.VersionedBuilder builder) {
+        builder.addVersion(VERSION, ConfigurationTransformation.builder().build());
+    }
+}

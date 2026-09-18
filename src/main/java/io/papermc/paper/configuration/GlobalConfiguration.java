@@ -22,7 +22,7 @@ import org.slf4j.Logger;
 @SuppressWarnings({"CanBeFinal", "FieldCanBeLocal", "FieldMayBeFinal", "NotNullFieldNotInitialized", "InnerClassMayBeStatic"})
 public class GlobalConfiguration extends ConfigurationPart {
     private static final Logger LOGGER = LogUtils.getLogger();
-    static final int CURRENT_VERSION = 29; // (when you change the version, change the comment, so it conflicts on rebases): <insert changes here>
+    static final int CURRENT_VERSION = 31; // Youer - incremental Linear v2 settings
     private static GlobalConfiguration instance;
     public static boolean isFirstStart = false;
     public static GlobalConfiguration get() {
@@ -181,48 +181,92 @@ public class GlobalConfiguration extends ConfigurationPart {
         public boolean simplifyRemoteItemMatching = false;
         @Comment(
             "Controls which on-disk region file format is used for saving/loading chunks. ANVIL is the vanilla " +
-            ".mca format. LINEAR uses the third-party .linear format (see " +
-            "github.com/xymb-endcrystalme/LinearRegionFileFormatTools), which compresses an entire 32x32 region as " +
-            "a single stream instead of per-chunk, typically giving much better compression ratios at the cost of " +
-            "needing to rewrite/recompress the whole region file on every flush. Existing .linear or .mca files " +
-            "found on disk are always honored regardless of this setting - it only controls the format used for " +
-            "brand-new regions. Switching this after regions already exist does not retroactively convert them."
+            ".mca format. LINEAR uses incremental per-chunk Zstandard records. Legacy whole-region Linear v1 files " +
+            "are migrated to v2 when opened. Existing files are honored regardless of this setting, which only " +
+            "controls the format used for brand-new regions. When both formats exist, their newest valid chunks " +
+            "are merged into Linear and the Anvil file is archived."
         )
         public RegionFileFormat regionFileFormat = RegionFileFormat.ANVIL;
         @Comment(
+            "Safe Linear persistence preset. LOW/NORMAL/AGGRESSIVE fill compression, flush workers, flush interval, " +
+            "cache budget, queue limit, and compaction threshold when the matching expert field is left at -1. " +
+            "The region format itself stays ANVIL unless region-file-format is changed."
+        )
+        public LinearPreset linearPreset = LinearPreset.NORMAL;
+        @Comment(
             "The zstd compression level used when writing .linear region files (1-22, higher = smaller files but " +
-            "more CPU). Defaults to a fast level since Linear recompresses the entire region (not just the changed " +
-            "chunk) on every flush; raise it to 6-9+ if you want smaller files on disk and can afford the extra CPU."
+            "more CPU). -1 follows linear-preset."
         )
-        public int linearCompressionLevel = 3;
+        @Constraints.Min(-1)
+        public int linearCompressionLevel = -1;
         @Comment(
-            "Number of background worker threads used to compress/write dirty .linear regions asynchronously, " +
-            "instead of blocking chunk I/O while a region is recompressed and saved. Different regions may be " +
-            "processed in parallel, but the same region is never flushed by more than one worker at a time. " +
-            "Changes require a restart."
+            "Number of background worker threads used to compress and append dirty Linear chunks asynchronously. " +
+            "Different regions may be processed in parallel, but the same region has one writer at a time. -1 " +
+            "follows linear-preset. Changes require a restart."
         )
-        @Constraints.Min(1)
-        public int linearFlushThreads = 2;
-        @Comment("How often, in seconds, the background .linear flusher checks for dirty regions to save.")
-        @Constraints.Min(1)
-        public int linearFlushIntervalSeconds = 5;
+        @Constraints.Min(-1)
+        public int linearFlushThreads = -1;
+        @Comment("How often, in seconds, the background .linear flusher checks for dirty regions to save. -1 follows linear-preset.")
+        @Constraints.Min(-1)
+        public int linearFlushIntervalSeconds = -1;
         @Comment(
-            "Number of internal worker threads zstd itself uses to compress a single .linear region, via zstd's " +
-            "own multi-threaded compression API. This is separate from and safe alongside linear-flush-threads - " +
-            "it parallelizes work within one compression job rather than across regions, entirely inside zstd's " +
-            "own library, with no Minecraft-side concurrency involved. 0 disables this (default, unchanged " +
-            "behavior); try 2-4 if compression is still a CPU bottleneck after lowering linear-compression-level."
+            "Number of internal worker threads zstd uses for one chunk compression operation. Keep this at 0 when " +
+            "multiple Linear flush workers are enabled to avoid CPU oversubscription. -1 follows linear-preset."
         )
-        public int linearCompressionThreads = 0;
+        @Constraints.Min(-1)
+        public int linearCompressionThreads = -1;
         @Comment(
-            "Maximum estimated memory, in megabytes, that cached .linear regions' decompressed chunk data may use " +
-            "at once. Unlike Anvil, Linear has to hold a whole region's chunks decompressed in memory while it's " +
-            "cached (inherent to the format, not specific to this implementation) - this bounds that growth " +
-            "independently of region-file-cache-size, evicting the least-recently-used region early if needed. " +
-            "Has no effect on Anvil regions."
+            "Maximum estimated memory, in megabytes, used by cached Linear indexes and pending raw chunk writes. " +
+            "The cache evicts least-recently-used Linear regions when this budget is exceeded. -1 follows " +
+            "linear-preset and has no effect on Anvil regions."
         )
-        @Constraints.Min(1)
-        public int linearRegionCacheMemoryBudgetMb = 512;
+        @Constraints.Min(-1)
+        public int linearRegionCacheMemoryBudgetMb = -1;
+        @Comment(
+            "Maximum raw bytes of pending Linear chunk writes, in megabytes. When this budget is exceeded the " +
+            "flusher drains immediately and logs that persistence is falling behind; writes remain coalesced to " +
+            "the newest generation and are not dropped. -1 follows linear-preset."
+        )
+        @Constraints.Min(-1)
+        public int linearFlushQueueMaxMb = -1;
+        @Comment("Minimum Linear v2 file size, in megabytes, before stale append records may be compacted. -1 follows linear-preset.")
+        @Constraints.Min(-1)
+        public int linearCompactionThresholdMb = -1;
+
+        public int effectiveLinearCompressionLevel() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearCompressionLevel > 0 ? this.linearCompressionLevel : preset.compressionLevel;
+        }
+
+        public int effectiveLinearFlushThreads() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearFlushThreads > 0 ? this.linearFlushThreads : preset.flushThreads;
+        }
+
+        public int effectiveLinearFlushIntervalSeconds() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearFlushIntervalSeconds > 0 ? this.linearFlushIntervalSeconds : preset.flushIntervalSeconds;
+        }
+
+        public int effectiveLinearCompressionThreads() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearCompressionThreads >= 0 ? this.linearCompressionThreads : preset.compressionThreads;
+        }
+
+        public int effectiveLinearRegionCacheMemoryBudgetMb() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearRegionCacheMemoryBudgetMb > 0 ? this.linearRegionCacheMemoryBudgetMb : preset.cacheMemoryBudgetMb;
+        }
+
+        public int effectiveLinearFlushQueueMaxMb() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearFlushQueueMaxMb > 0 ? this.linearFlushQueueMaxMb : preset.flushQueueMaxMb;
+        }
+
+        public int effectiveLinearCompactionThresholdMb() {
+            LinearPreset preset = this.linearPreset == null ? LinearPreset.NORMAL : this.linearPreset;
+            return this.linearCompactionThresholdMb > 0 ? this.linearCompactionThresholdMb : preset.compactionThresholdMb;
+        }
 
         public enum CompressionFormat {
             GZIP,
@@ -235,6 +279,30 @@ public class GlobalConfiguration extends ConfigurationPart {
         public enum RegionFileFormat {
             ANVIL,
             LINEAR
+        }
+
+        public enum LinearPreset {
+            LOW(1, 1, 2, 0, 128, 64, 128),
+            NORMAL(3, 2, 1, 0, 256, 128, 256),
+            AGGRESSIVE(5, 3, 1, 0, 512, 256, 512);
+
+            public final int compressionLevel;
+            public final int flushThreads;
+            public final int flushIntervalSeconds;
+            public final int compressionThreads;
+            public final int cacheMemoryBudgetMb;
+            public final int flushQueueMaxMb;
+            public final int compactionThresholdMb;
+
+            LinearPreset(int compressionLevel, int flushThreads, int flushIntervalSeconds, int compressionThreads, int cacheMemoryBudgetMb, int flushQueueMaxMb, int compactionThresholdMb) {
+                this.compressionLevel = compressionLevel;
+                this.flushThreads = flushThreads;
+                this.flushIntervalSeconds = flushIntervalSeconds;
+                this.compressionThreads = compressionThreads;
+                this.cacheMemoryBudgetMb = cacheMemoryBudgetMb;
+                this.flushQueueMaxMb = flushQueueMaxMb;
+                this.compactionThresholdMb = compactionThresholdMb;
+            }
         }
     }
 
