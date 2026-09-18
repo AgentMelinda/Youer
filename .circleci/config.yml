@@ -1,0 +1,51 @@
+version: 2.1
+
+executors:
+  java21:
+    docker:
+      - image: cimg/openjdk:21.0
+    resource_class: large
+    working_directory: ~/youer
+
+jobs:
+  build:
+    executor: java21
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - youer-gradle-v1-{{ checksum "build.gradle" }}-{{ checksum "projects/youer/build.gradle" }}
+            - youer-gradle-v1-
+
+      - run:
+          name: Setup sources
+          command: |
+            chmod +x ./gradlew
+            ./gradlew setup --no-daemon
+
+      - run:
+          name: Build Youer server jar
+          command: ./gradlew youerJar --no-daemon
+          no_output_timeout: 30m
+
+      - save_cache:
+          key: youer-gradle-v1-{{ checksum "build.gradle" }}-{{ checksum "projects/youer/build.gradle" }}
+          paths:
+            - ~/.gradle/caches
+            - ~/.gradle/wrapper
+
+      - store_artifacts:
+          path: projects/youer/build/libs/
+          destination: server-jars
+
+workflows:
+  version: 2
+  build-on-push:
+    jobs:
+      - build:
+          filters:
+            branches:
+              only:
+                - linear-region-format
+                - 1.21.1
