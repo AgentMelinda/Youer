@@ -19,14 +19,10 @@ jobs:
             - youer-gradle-v1-
 
       - run:
-          name: Setup sources
+          name: Build Youer server jar
           command: |
             chmod +x ./gradlew
-            ./gradlew setup --no-daemon
-
-      - run:
-          name: Build Youer server jar
-          command: ./gradlew youerJar --no-daemon
+            ./gradlew youerJar --no-daemon
           no_output_timeout: 30m
 
       - save_cache:
